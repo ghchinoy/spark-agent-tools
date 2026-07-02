@@ -13,6 +13,74 @@ with a complete OAuth 2.1 authorization layer baked in.
 
 ---
 
+## Quick start
+
+**Prerequisites:** Go 1.25+. To deploy, also the `gcloud` CLI and a GCP project
+with billing.
+
+Run the `hello-world` server locally with auth bypassed — the fastest way to see
+it work:
+
+```bash
+cd hello-world
+make run-dev            # serves on :8080, AUTH_BYPASS=true
+```
+
+Watch the OAuth discovery chain respond:
+
+```bash
+curl -s localhost:8080/.well-known/oauth-protected-resource | jq
+curl -s localhost:8080/.well-known/oauth-authorization-server | jq
+curl -s -X POST localhost:8080/api/oauth/register \
+  -H 'content-type: application/json' \
+  -d '{"redirect_uris":["https://example.com/cb"],"client_name":"demo"}' | jq
+```
+
+Run the full test suite (it walks DCR → authorize → PKCE token → protected call
+in-process):
+
+```bash
+make test
+```
+
+To enforce the real OAuth/JWT layer instead of bypassing it:
+
+```bash
+JWT_SIGNING_KEY=$(openssl rand -hex 32) make run
+```
+
+## Deploy and connect to Spark
+
+```bash
+cd hello-world
+cp .env.example .env    # set GCP_PROJECT
+make deploy             # builds from source, prints your Service URL
+```
+
+Paste the printed Service URL into Gemini Spark → Connected Apps. The full
+click-through and a troubleshooting table are in
+[`docs/connecting-spark.md`](docs/connecting-spark.md).
+
+> **See also:** Google Cloud's official tutorial
+> [Build and deploy a remote MCP server on Cloud Run](https://cloud.google.com/run/docs/tutorials/deploy-remote-mcp-server)
+> shows the same deployment pattern in Python using FastMCP and Cloud Run's
+> built-in IAM auth. That approach works well for developer tooling. This repo
+> adds the OAuth 2.1 discovery + authorization chain (RFC 9728 / 8414 / 7591 /
+> 7636) that Gemini Spark specifically requires on top of it.
+
+---
+
+## Documentation
+
+| If you want to… | Read | 
+| :--- | :--- |
+| Build a Spark-ready MCP server step by step | [`docs/TUTORIAL.md`](docs/TUTORIAL.md) |
+| Connect a deployed server to Spark, with troubleshooting | [`docs/connecting-spark.md`](docs/connecting-spark.md) |
+| Understand *why* Spark needs the OAuth 2.1 chain | [`docs/oauth-deep-dive.md`](docs/oauth-deep-dive.md) |
+| See how Spark actually behaves — real traces and gotchas | [`docs/LESSONS_LEARNED.md`](docs/LESSONS_LEARNED.md) |
+
+---
+
 ## Why this exists
 
 When you paste a plain MCP URL into Spark, you may hit:
@@ -30,10 +98,10 @@ When you paste a plain MCP URL into Spark, you may hit:
 | **RFC 7591** Dynamic Client Registration | `/api/oauth/register` | "Automatic registration" — get a `client_id` with no human in the loop |
 | **RFC 7636** PKCE authorization-code flow | `/authorize` + `/api/oauth/token` | Get a user-consented bearer token |
 
-The shared `pkg/mcpauth` package in this repo implements all four. Each tool
-subdirectory wires it in with a handful of lines so tool code is purely tool
-logic. See [`docs/oauth-deep-dive.md`](docs/oauth-deep-dive.md) for the full
-story of *why* each piece is required.
+The shared `pkg/mcpauth` package implements all four. Each tool subdirectory
+wires it in with a handful of lines so tool code is purely tool logic. See
+[`docs/oauth-deep-dive.md`](docs/oauth-deep-dive.md) for the full story of *why*
+each piece is required.
 
 ---
 
@@ -55,8 +123,9 @@ hello-world/                    MCP server: one "echo" tool, complete auth scaff
 
 docs/
   TUTORIAL.md                   build-it-yourself walkthrough
-  oauth-deep-dive.md            why RFC 9728/8414/7591/7636, with request traces
   connecting-spark.md           connect from the Spark UI + troubleshooting table
+  oauth-deep-dive.md            why RFC 9728/8414/7591/7636, with request traces
+  LESSONS_LEARNED.md            field notes from live Spark connections
   architecture.webp             the discovery + auth flow, visualized
 ```
 
@@ -65,60 +134,12 @@ To add a new tool: create a subdirectory (e.g. `calendar-tool/`), add
 
 ---
 
-## Quick start — hello-world
+## What to change for production
 
-```bash
-cd hello-world
-
-# Fastest local loop — auth bypassed, no token needed
-make run-dev            # serves on :8080
-
-# Or run with the full OAuth/JWT layer
-JWT_SIGNING_KEY=$(openssl rand -hex 32) make run
-```
-
-Watch the discovery chain respond:
-
-```bash
-curl -s localhost:8080/.well-known/oauth-protected-resource | jq
-curl -s localhost:8080/.well-known/oauth-authorization-server | jq
-curl -s -X POST localhost:8080/api/oauth/register \
-  -H 'content-type: application/json' \
-  -d '{"redirect_uris":["https://example.com/cb"],"client_name":"demo"}' | jq
-```
-
-Run the tests (they walk the full DCR → authorize → PKCE token → protected
-resource flow in-process):
-
-```bash
-make test   # or: cd hello-world && make test
-```
-
-## Deploy to Cloud Run
-
-```bash
-cd hello-world
-cp .env.example .env    # set GCP_PROJECT
-make deploy             # builds from source, prints your Service URL
-```
-
-Then paste the Service URL into Gemini Spark — see
-[`docs/connecting-spark.md`](docs/connecting-spark.md).
-
-> **See also:** Google Cloud's official tutorial
-> [Build and deploy a remote MCP server on Cloud Run](https://cloud.google.com/run/docs/tutorials/deploy-remote-mcp-server)
-> shows the same deployment pattern in Python using FastMCP and Cloud Run's
-> built-in IAM auth. That approach works well for developer tooling. This repo
-> adds the OAuth 2.1 discovery + authorization chain (RFC 9728 / 8414 / 7591 /
-> 7636) that Gemini Spark specifically requires on top of it.
-
----
-
-## Scope & honesty about the demo
-
-To stay runnable anywhere, `hello-world` makes two deliberate simplifications
-that you **must** change for production (each is flagged in `pkg/mcpauth` and
-in [`docs/oauth-deep-dive.md`](docs/oauth-deep-dive.md#from-demo-to-production)):
+`hello-world` keeps two things minimal so it runs anywhere with no external
+dependencies. Both are flagged in `pkg/mcpauth` and in
+[`docs/oauth-deep-dive.md`](docs/oauth-deep-dive.md#from-demo-to-production),
+and both need changing for a real deployment:
 
 1. **In-memory state.** Registered clients and auth codes live in RAM, so a cold
    start forgets them. Plug in a DB-backed `mcpauth.Store` implementation for
