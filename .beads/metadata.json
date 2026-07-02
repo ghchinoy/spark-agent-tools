@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "spark_agent_tools",
+  "project_id": "5e26cd28-8d17-44b1-aecc-12573e71c4ae"
+}
