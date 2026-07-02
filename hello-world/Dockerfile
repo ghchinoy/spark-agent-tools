@@ -1,10 +1,9 @@
 # ── Build stage ───────────────────────────────────────────────────────────────
-# This Dockerfile is at the repo root so 'gcloud run deploy --source .' works.
-# Build context is the repo root (where go.mod lives), which makes pkg/mcpauth
-# available to the build.
+# For local Docker builds only. Run from the repo root (where go.mod lives):
+#   docker build -f hello-world/Dockerfile -t hello-mcp .
 #
-# Local Docker build:
-#   docker build -t hello-mcp .
+# For Cloud Run deploys, use the Dockerfile at the repo root — gcloud run deploy
+# requires the Dockerfile to be at the root of the --source directory.
 FROM golang:1.25 AS build
 WORKDIR /src
 

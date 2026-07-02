@@ -19,31 +19,48 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+
+	"github.com/ghchinoy/spark-agent-tools/pkg/mcpauth"
 )
 
 func main() {
 	// baseURL is only needed for local logging; at request time we always
-	// derive the public origin from the incoming request (see requestBaseURL)
-	// so the same binary works locally and behind the Cloud Run proxy.
+	// derive the public origin from the incoming request (see requestBaseURL in
+	// pkg/mcpauth) so the same binary works locally and behind the Cloud Run
+	// proxy.
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
 	// The single OAuth authorization server + resource server for this demo.
-	// In production you would inject persistent stores and a real IdP here.
-	authz := newAuthServer()
+	// In production you would inject persistent stores and a real IdP here via
+	// mcpauth.Options (see pkg/mcpauth for the full Options API).
+	authz := mcpauth.NewAuthServer(mcpauth.Options{
+		ServerName:              "Hello MCP",
+		ServiceDocumentationURI: "https://github.com/ghchinoy/spark-agent-tools",
+		// PolicyURI and TOSURI are optional; set them to real URLs in production.
+		// They appear in RFC 8414 AS metadata and RFC 7591 DCR responses.
+		// PolicyURI: "https://example.com/privacy",
+		// TOSURI:    "https://example.com/terms",
+	})
 
 	// Build the MCP server (the "echo" tool) and wrap it in the transport
 	// multiplexer that speaks both SSE and Streamable HTTP.
 	mcpHandler := newMCPHandler()
 
 	// secured = require a valid Bearer JWT before any MCP traffic is served.
-	secured := authz.requireBearer(mcpHandler)
+	// logMCPMethod wraps the handler to surface the MCP method name from the
+	// JSON-RPC body — turning opaque "POST /" log lines into e.g.
+	// "[mcp] initialize", "[mcp] tools/list", "[mcp] tools/call echo".
+	secured := authz.RequireBearer(logMCPMethod(mcpHandler))
 
 	mux := http.NewServeMux()
 
@@ -53,27 +70,21 @@ func main() {
 		_, _ = fmt.Fprintln(w, "ok")
 	})
 
-	// ── Public OAuth discovery (unauthenticated) ─────────────────────────────
-	// RFC 9728 — Protected Resource Metadata. Spark probes this FIRST (both the
-	// bare path and a resource-path-suffixed variant like .../mcp), so we serve
-	// the exact path and the trailing-slash subtree.
-	mux.HandleFunc(protectedResourcePath, authz.handleProtectedResourceMetadata)
-	mux.HandleFunc(protectedResourcePath+"/", authz.handleProtectedResourceMetadata)
+	// ── Icon ─────────────────────────────────────────────────────────────────
+	// Serve the server icon at both /icon.svg and /favicon.ico.
+	// Modern browsers and some MCP clients fetch these directly.
+	iconHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/svg+xml")
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		_, _ = fmt.Fprint(w, iconSVG)
+	}
+	mux.HandleFunc("/icon.svg", iconHandler)
+	mux.HandleFunc("/favicon.ico", iconHandler)
 
-	// RFC 8414 — Authorization Server Metadata. Advertises the token,
-	// registration, and authorization endpoints and PKCE support.
-	mux.HandleFunc("/.well-known/oauth-authorization-server", authz.handleAuthServerMetadata)
-
-	// ── OAuth endpoints ──────────────────────────────────────────────────────
-	// RFC 7591 — Dynamic Client Registration. This is what makes Spark's
-	// "automatic registration" work; without it Spark asks for a manual
-	// client ID / secret.
-	mux.HandleFunc("/api/oauth/register", authz.handleRegister)
-
-	// RFC 6749 / RFC 7636 — the browser-facing consent page and the
-	// back-channel token exchange (PKCE S256).
-	mux.HandleFunc("/authorize", authz.handleAuthorize)
-	mux.HandleFunc("/api/oauth/token", authz.handleToken)
+	// ── OAuth 2.1 discovery + flow routes (unauthenticated) ─────────────────
+	// Mounts: RFC 9728 PRM, RFC 8414 AS metadata, RFC 7591 DCR,
+	//         RFC 6749/7636 authorize + token endpoints.
+	mcpauth.Mount(mux, authz)
 
 	// ── MCP tool surface (Bearer JWT required) ───────────────────────────────
 	// Primary documented endpoint.
@@ -86,7 +97,7 @@ func main() {
 
 	log.Printf("hello-mcp listening on :%s", port)
 	log.Printf("  MCP endpoint:        /mcp  (and / )")
-	log.Printf("  PRM discovery:       %s", protectedResourcePath)
+	log.Printf("  PRM discovery:       %s", mcpauth.ProtectedResourcePath)
 	log.Printf("  AS metadata:         /.well-known/oauth-authorization-server")
 	log.Printf("  DCR register:        /api/oauth/register")
 	if err := http.ListenAndServe(":"+port, logRequests(mux)); err != nil {
@@ -101,6 +112,39 @@ func logRequests(next http.Handler) http.Handler {
 		log.Printf("[req] %s %s (User-Agent: %s)", r.Method, r.URL.Path, r.UserAgent())
 		// Streamable HTTP / SSE must not be buffered by the proxy.
 		w.Header().Set("X-Accel-Buffering", "no")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// logMCPMethod peeks at the JSON-RPC method field in POST request bodies and
+// logs it as "[mcp] <method>" before passing the request through. For
+// tools/call it also logs the tool name from the params.
+//
+// Only the first 512 bytes are read for the peek — enough to extract the
+// method and tool name from any real MCP message — and the body is fully
+// restored before the downstream handler sees it.
+func logMCPMethod(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.Body != nil {
+			peek, err := io.ReadAll(io.LimitReader(r.Body, 512))
+			// Restore the body regardless of whether we could read it.
+			r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peek), r.Body))
+			if err == nil && len(peek) > 0 {
+				var msg struct {
+					Method string `json:"method"`
+					Params struct {
+						Name string `json:"name"` // tools/call, prompts/get
+					} `json:"params"`
+				}
+				if json.Unmarshal(peek, &msg) == nil && msg.Method != "" {
+					if msg.Params.Name != "" {
+						log.Printf("[mcp] %s %s", msg.Method, msg.Params.Name)
+					} else {
+						log.Printf("[mcp] %s", msg.Method)
+					}
+				}
+			}
+		}
 		next.ServeHTTP(w, r)
 	})
 }

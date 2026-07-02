@@ -1,32 +1,33 @@
-.PHONY: run run-dev test build tidy fmt vet deploy token help
+.PHONY: test build tidy fmt vet lint help
 
-BINARY := hello-mcp
-PORT ?= 8080
+# ── Monorepo root Makefile ────────────────────────────────────────────────────
+# Runs quality gates across the whole module (pkg/mcpauth + hello-world).
+# To build or run a specific tool, cd into its directory and use its Makefile:
+#
+#   cd hello-world && make run-dev
+#   cd hello-world && make deploy
+#
+# The Dockerfile at the repo root is used by Cloud Run source deploy.
+# For local Docker builds: docker build -t hello-mcp .
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 	  awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
-run: ## Run the server (auth enforced; set JWT_SIGNING_KEY)
-	PORT=$(PORT) go run .
+test: ## Run the full test suite (all packages)
+	go test -race -count=1 ./...
 
-run-dev: ## Run with auth bypassed (local only, no token needed)
-	AUTH_BYPASS=true PORT=$(PORT) go run .
-
-build: ## Build the binary to ./bin/hello-mcp
-	go build -o bin/$(BINARY) .
-
-test: ## Run the test suite
-	go test ./...
+build: ## Build all tools
+	go build ./...
 
 tidy: ## Tidy go.mod/go.sum
 	go mod tidy
 
-fmt: ## Format the code
+fmt: ## Format all Go source
 	gofmt -w .
 
-vet: ## Run go vet
+vet: ## Run go vet across all packages
 	go vet ./...
 
-deploy: ## Build & deploy to Cloud Run (reads .env)
-	./scripts/deploy.sh
+lint: ## Run golangci-lint (must report 0 issues)
+	golangci-lint run

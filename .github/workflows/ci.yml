@@ -11,6 +11,10 @@ jobs:
     name: build · test · lint
     runs-on: ubuntu-latest
 
+    # All Go commands run from the repo root where go.mod lives.
+    # This covers the full module: pkg/mcpauth + hello-world (and any future
+    # tool subdirectories). To target a single tool, cd into its directory.
+
     strategy:
       matrix:
         # Keep in sync with go.mod. Using a range lets dependabot bump cleanly.

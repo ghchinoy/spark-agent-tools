@@ -4,28 +4,33 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 # Deploy hello-spark-mcp to Google Cloud Run (source-based build).
 #
-#   1. Reads config from .env (creating one with a random JWT key if missing).
+#   1. Reads config from hello-world/.env (creating one with a random JWT key
+#      if missing).
 #   2. Creates a dedicated, minimal-privilege service account (no extra roles —
 #      this demo has no Firestore/Vertex dependencies).
 #   3. Deploys with --allow-unauthenticated so Spark can reach it; the MCP tools
 #      are still protected by our own OAuth 2.1 / JWT layer inside the app.
+#
+# Run from the hello-world/ directory or via: make deploy
 # ─────────────────────────────────────────────────────────────────────────────
 
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPTS_DIR")"
-ENV_FILE="$PROJECT_ROOT/.env"
+HELLO_WORLD_DIR="$(dirname "$SCRIPTS_DIR")"
+# go.mod lives at the repo root, one level above hello-world/.
+PROJECT_ROOT="$(dirname "$HELLO_WORLD_DIR")"
+ENV_FILE="$HELLO_WORLD_DIR/.env"
 
 DEFAULT_REGION="us-central1"
 DEFAULT_SERVICE_NAME="hello-spark-mcp"
 
 if [ -f "$ENV_FILE" ]; then
-    echo "Loading deployment config from .env..."
+    echo "Loading deployment config from hello-world/.env..."
     set -a
     # shellcheck disable=SC1090
     source "$ENV_FILE"
     set +a
 else
-    echo "No .env found — creating one with a generated JWT key..."
+    echo "No hello-world/.env found — creating one with a generated JWT key..."
     RANDOM_JWT_KEY=$(openssl rand -hex 32 2>/dev/null || od -vN 32 -An -tx1 /dev/urandom | tr -d ' \n' | head -c 64)
     cat <<EOF > "$ENV_FILE"
 GCP_PROJECT=
@@ -33,11 +38,11 @@ GCP_REGION=$DEFAULT_REGION
 SERVICE_NAME=$DEFAULT_SERVICE_NAME
 JWT_SIGNING_KEY=$RANDOM_JWT_KEY
 EOF
-    echo "Created $ENV_FILE — set GCP_PROJECT and re-run."
+    echo "Created hello-world/.env — set GCP_PROJECT and re-run."
     exit 1
 fi
 
-: "${GCP_PROJECT:?Set GCP_PROJECT in .env}"
+: "${GCP_PROJECT:?Set GCP_PROJECT in hello-world/.env}"
 GCP_REGION="${GCP_REGION:-$DEFAULT_REGION}"
 SERVICE_NAME="${SERVICE_NAME:-$DEFAULT_SERVICE_NAME}"
 if [ -z "${JWT_SIGNING_KEY:-}" ]; then
@@ -63,6 +68,7 @@ if ! gcloud iam service-accounts describe "$SA_EMAIL" &>/dev/null; then
 fi
 # No extra IAM roles needed: this demo stores nothing external.
 
+# Source is the repo root (go.mod and Dockerfile both live there).
 # CACHE_BUSTER forces a fresh container build even if source is unchanged.
 gcloud run deploy "$SERVICE_NAME" \
     --source "$PROJECT_ROOT" \
@@ -70,6 +76,7 @@ gcloud run deploy "$SERVICE_NAME" \
     --memory "128Mi" \
     --cpu "1" \
     --port "8080" \
+    --timeout "3600" \
     --service-account "$SA_EMAIL" \
     --allow-unauthenticated \
     --session-affinity \

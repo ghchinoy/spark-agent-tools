@@ -1,4 +1,4 @@
-package main
+package mcpauth
 
 import (
 	"crypto/sha256"
@@ -11,8 +11,13 @@ import (
 	"testing"
 )
 
+// newTestServer returns an AuthServer backed by a fresh in-memory store.
+func newTestServer() *AuthServer {
+	return NewAuthServer(Options{JWTSigningKey: "test-key-not-for-production"})
+}
+
 // registerTestClient posts a DCR registration and returns the issued client_id.
-func registerTestClient(t *testing.T, s *authServer, redirectURI string) string {
+func registerTestClient(t *testing.T, s *AuthServer, redirectURI string) string {
 	t.Helper()
 	body, _ := json.Marshal(registrationRequest{
 		RedirectURIs: []string{redirectURI},
@@ -40,10 +45,10 @@ func registerTestClient(t *testing.T, s *authServer, redirectURI string) string 
 }
 
 func TestDiscoveryEndpoints(t *testing.T) {
-	s := newAuthServer()
+	s := newTestServer()
 
 	// RFC 9728 PRM — bare path.
-	req := httptest.NewRequest(http.MethodGet, protectedResourcePath, nil)
+	req := httptest.NewRequest(http.MethodGet, ProtectedResourcePath, nil)
 	req.Host = "example.com"
 	w := httptest.NewRecorder()
 	s.handleProtectedResourceMetadata(w, req)
@@ -57,7 +62,7 @@ func TestDiscoveryEndpoints(t *testing.T) {
 	}
 
 	// RFC 9728 PRM — path-suffixed variant.
-	req = httptest.NewRequest(http.MethodGet, protectedResourcePath+"/mcp", nil)
+	req = httptest.NewRequest(http.MethodGet, ProtectedResourcePath+"/mcp", nil)
 	req.Host = "example.com"
 	w = httptest.NewRecorder()
 	s.handleProtectedResourceMetadata(w, req)
@@ -83,7 +88,7 @@ func TestDiscoveryEndpoints(t *testing.T) {
 }
 
 func TestRegisterValidation(t *testing.T) {
-	s := newAuthServer()
+	s := newTestServer()
 
 	// Missing redirect_uris → 400.
 	req := httptest.NewRequest(http.MethodPost, "/api/oauth/register", strings.NewReader(`{}`))
@@ -108,7 +113,7 @@ func TestRegisterValidation(t *testing.T) {
 // TestFullAuthCodeFlow walks the complete DCR → authorize → token → protected
 // resource sequence with PKCE, exactly as Spark does.
 func TestFullAuthCodeFlow(t *testing.T) {
-	s := newAuthServer()
+	s := newTestServer()
 	redirectURI := "https://client.example/callback"
 	clientID := registerTestClient(t, s, redirectURI)
 
@@ -166,7 +171,7 @@ func TestFullAuthCodeFlow(t *testing.T) {
 	}
 
 	// The issued token must pass the Bearer middleware.
-	protected := s.requireBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	protected := s.RequireBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	req = httptest.NewRequest(http.MethodGet, "/mcp", nil)
@@ -179,7 +184,7 @@ func TestFullAuthCodeFlow(t *testing.T) {
 }
 
 func TestTokenRejectsBadPKCE(t *testing.T) {
-	s := newAuthServer()
+	s := newTestServer()
 	redirectURI := "https://client.example/callback"
 	clientID := registerTestClient(t, s, redirectURI)
 
@@ -213,8 +218,8 @@ func TestTokenRejectsBadPKCE(t *testing.T) {
 }
 
 func TestChallengeCarriesResourceMetadata(t *testing.T) {
-	s := newAuthServer()
-	protected := s.requireBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	s := newTestServer()
+	protected := s.RequireBearer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	req := httptest.NewRequest(http.MethodGet, "/mcp", nil)
 	req.Host = "example.com"
 	w := httptest.NewRecorder()
@@ -240,5 +245,62 @@ func TestRedirectURIMatchLoopback(t *testing.T) {
 	// Non-loopback must be exact.
 	if redirectURIMatch("https://a.example/cb", "https://b.example/cb") {
 		t.Error("non-loopback hosts must match exactly")
+	}
+}
+
+func TestResolveSubjectHook(t *testing.T) {
+	// Verify that a non-nil ResolveSubject hook is used instead of the demo
+	// form-based flow.
+	s := NewAuthServer(Options{
+		JWTSigningKey: "test-key-not-for-production",
+		ResolveSubject: func(r *http.Request) (string, bool) {
+			// Simulate a successful IdP check.
+			return "real-user@example.com", true
+		},
+	})
+	redirectURI := "https://client.example/callback"
+	clientID := registerTestClient(t, s, redirectURI)
+
+	sum := sha256.Sum256([]byte("verifier-abc"))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	// POST without a "decision" field — the hook should still approve.
+	form := url.Values{
+		"client_id":      {clientID},
+		"redirect_uri":   {redirectURI},
+		"code_challenge": {challenge},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/authorize", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	s.handleAuthorize(w, req)
+	if w.Code != http.StatusFound {
+		t.Fatalf("hook approve: want 302, got %d (%s)", w.Code, w.Body.String())
+	}
+	loc, _ := url.Parse(w.Header().Get("Location"))
+	code := loc.Query().Get("code")
+	if code == "" {
+		t.Fatal("no code returned")
+	}
+
+	// Exchange for a token and verify the subject claim is from the hook.
+	tokBody, _ := json.Marshal(map[string]string{
+		"grant_type":    "authorization_code",
+		"code":          code,
+		"client_id":     clientID,
+		"redirect_uri":  redirectURI,
+		"code_verifier": "verifier-abc",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/api/oauth/token", strings.NewReader(string(tokBody)))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	s.handleToken(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("token: want 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	var tr tokenResponse
+	_ = json.NewDecoder(w.Body).Decode(&tr)
+	if tr.AccessToken == "" {
+		t.Fatal("no access token in response")
 	}
 }
