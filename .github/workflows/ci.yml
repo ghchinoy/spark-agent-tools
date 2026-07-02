@@ -50,4 +50,8 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+          # goinstall builds the linter from source using the Go toolchain
+          # already set up above, avoiding the "built with Go 1.24 < 1.25.5"
+          # binary compatibility error that occurs with pre-compiled releases.
+          install-mode: goinstall
           args: --timeout=5m
