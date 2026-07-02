@@ -168,11 +168,20 @@ pattern is:
 POST /   200   rapid RPC — Spark sends a message, server responds synchronously
 POST /   202   async RPC — server accepted the message; response comes on the GET stream
 GET  /         long-lived SSE stream — server pushes responses for the 202 messages
+DELETE / 401   session teardown — Spark sends this after each conversation turn
 ```
 
 The `202 Accepted` status means "I received your message; watch the GET stream
 for the response." You will see `POST / → 200` and `POST / → 202` interleaved
 in logs, with each `202` paired to a `GET /` SSE connection already open.
+
+**`DELETE / → 401` after every turn.** Spark sends `DELETE /` with a
+`Mcp-Session-Id` header to terminate the Streamable HTTP session after each
+conversation turn. These consistently return `401` even when the same session's
+`POST /` requests succeed with the Bearer token moments later. This indicates
+Spark does not include the `Authorization` header on `DELETE` requests. The 401
+is harmless — the session continues for subsequent turns — but it produces
+noise in logs. Do not treat `DELETE 401` as a session or auth failure.
 
 `GET /` connections are what create long-latency entries in Cloud Run logs.
 Which leads directly to the next lesson.
@@ -419,18 +428,116 @@ the session state on both sides and starts fresh.
 
 ### Mitigations
 
+- **Server-side keepalive — `mcp.ServerOptions{KeepAlive: 30 * time.Second}`
+  (validated, primary mitigation):** The MCP Go SDK's `ServerOptions.KeepAlive`
+  field sends a ping to the client on the open GET stream at the specified interval.
+  This keeps the stream demonstrably alive, giving Spark's OpenAuth library no
+  reason to close and reopen it. If Spark stops responding to pings, the SDK
+  closes the session cleanly — the client gets a fresh reconnect rather than a
+  permanently stuck 409. Wire it in when constructing the server:
+  ```go
+  server := mcp.NewServer(&mcp.Implementation{Name: "my-server", Version: "1.0"},
+      &mcp.ServerOptions{KeepAlive: 30 * time.Second})
+  ```
+
+- **`--no-traffic` deploy (validated, prevents rollout-induced 409s):** Deploy
+  the new revision without immediately shifting traffic, so active sessions are
+  not disrupted. Cut over once sessions are idle:
+  ```bash
+  gcloud run deploy my-mcp-server --no-traffic [… other flags]
+  # when ready:
+  gcloud run services update-traffic my-mcp-server --to-latest --region us-central1
+  ```
+
 - **`--session-affinity`** (already in the deploy script): routes a client's
   requests to the same Cloud Run instance, reducing the chance that a reconnect
   hits a different instance with no session state.
-- **Avoid deployment rollouts mid-session**: Cloud Run's traffic-shifting during
-  deployment is the primary trigger. The `--no-traffic` flag lets you deploy a
-  new revision without immediately shifting traffic, then cut over when idle.
-- **Long-poll keepalives**: some MCP SDK configurations support periodic
-  heartbeat writes on the GET stream to prevent the server from treating it as
-  idle. Check the SDK's `StreamableHTTPHandlerOptions` for keepalive settings.
-- **Track 409 rate as a health signal**: a sustained 409 rate on `GET /sse` with
-  no new tool calls is a reliable indicator of a stuck session. A log-based alert
-  on this pattern would let you detect it without waiting for user reports.
+
+- **Track 409 rate as a health signal**: a sustained `GET /sse → 409` rate with
+  no new `[Tool Call]` log entries is a reliable indicator of a stuck session.
+  A log-based alert on this pattern lets you detect it without waiting for user
+  reports of a frozen "Thinking it through..." spinner.
+
+---
+
+## 12. MCP method logging: seeing inside the POST / black box
+
+All MCP protocol traffic over Streamable HTTP is `POST /`. Without body
+logging, you cannot distinguish `initialize` from `tools/list` from
+`prompts/list` from `tools/call` — they all look identical in Cloud Run logs.
+
+Add a middleware that peeks at the JSON-RPC `method` field before passing the
+request to the MCP handler:
+
+```go
+func logMCPMethod(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if r.Method == http.MethodPost && r.Body != nil {
+            peek, err := io.ReadAll(io.LimitReader(r.Body, 512))
+            r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peek), r.Body))
+            if err == nil {
+                var msg struct {
+                    Method string `json:"method"`
+                    Params struct{ Name string `json:"name"` } `json:"params"`
+                }
+                if json.Unmarshal(peek, &msg) == nil && msg.Method != "" {
+                    if msg.Params.Name != "" {
+                        log.Printf("[mcp] %s %s", msg.Method, msg.Params.Name)
+                    } else {
+                        log.Printf("[mcp] %s", msg.Method)
+                    }
+                }
+            }
+        }
+        next.ServeHTTP(w, r)
+    })
+}
+```
+
+Apply it between `RequireBearer` and the MCP handler so you only log
+authenticated traffic:
+
+```go
+secured := authz.RequireBearer(logMCPMethod(mcpHandler))
+```
+
+With this in place, logs show the exact MCP protocol sequence:
+
+```
+[mcp] initialize
+[mcp] tools/list
+[mcp] prompts/list          ← or absent, which tells you the client skips it
+[mcp] tools/call echo
+[tool] echo: "hello"
+```
+
+This is the only reliable way to confirm whether a client calls `prompts/list`,
+`resources/list`, or any other capability — HTTP-level logs alone cannot tell you.
+
+---
+
+## 13. MCP spec fields Spark's current client does not surface
+
+The MCP spec (via the Go SDK) supports `Icons`, `Title`, `WebsiteURL`, and
+`Instructions` on `Implementation`, and `Icons` and `Title` on `Tool`. It also
+supports `prompts` as a discoverable capability. Based on observed behavior with
+Spark's Connected Apps UI (as of July 2026):
+
+- **`Icons`** — delivered inline as a data URI in the `initialize` response.
+  No separate HTTP fetch is made for the icon. Spark's UI does not render it.
+- **`Title`** — present in the `initialize` response. Spark's UI shows the
+  Cloud Run service name, not the `Implementation.Title`.
+- **`Instructions`** — present in the `initialize` response. Not visible in
+  the Spark UI; likely consumed by the LLM context rather than rendered.
+- **`prompts/list`** — the server advertises the `prompts` capability in
+  `initialize`. Whether Spark calls `prompts/list` requires MCP method logging
+  to confirm (HTTP logs alone cannot tell you). No prompt-related UI appeared.
+- **`service_documentation`** (RFC 8414) — present in AS metadata which Spark
+  fetches. Not surfaced in Spark's Connected Apps UI.
+
+These fields are **correct per the MCP spec** and worth setting for other
+clients (Claude Desktop, opencode) that do read them. They are also
+forward-compatible — Spark may surface them in future releases.
 
 ---
 
@@ -444,6 +551,8 @@ the session state on both sides and starts fresh.
 - [ ] Token endpoint accepts (and ignores) the `?resource=` query parameter
 - [ ] Consent SPA handles opaque `client_id` strings without treating them as URLs
 - [ ] `requestBaseURL` derives origin from the request `Host` header, not a hardcoded value (both Cloud Run URL forms work without config)
+- [ ] `mcp.ServerOptions{KeepAlive: 30 * time.Second}` passed to `mcp.NewServer` (prevents GET stream idle closure → 409 conflict)
 - [ ] `gcloud run deploy` uses `--timeout 3600` (not the default 300s)
 - [ ] `--session-affinity` is set for Cloud Run (keeps streaming sessions on one instance)
+- [ ] Use `--no-traffic` when deploying while sessions are active; cut over manually with `update-traffic --to-latest`
 - [ ] Registered clients are persisted across cold starts (in-memory state re-registers on every cold start and on each Cloud Run URL form Spark probes)
