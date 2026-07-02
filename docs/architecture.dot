@@ -1,0 +1,113 @@
+digraph SparkMCP {
+    fontname="Outfit,sans-serif";
+    fontsize=12;
+    rankdir=LR;
+    nodesep=0.5;
+    ranksep=0.9;
+    bgcolor="#F8FAFC";
+    splines=true;
+    overlap=false;
+
+    node [
+        fontname="Outfit,sans-serif";
+        fontsize=10;
+        shape=box;
+        style="filled,rounded";
+        fillcolor="#FFFFFF";
+        fontcolor="#0F172A";
+        color="#CBD5E1";
+        penwidth=1.5;
+    ];
+    edge [
+        fontname="Outfit,sans-serif";
+        fontsize=9;
+        fontcolor="#64748B";
+        color="#94A3B8";
+        arrowsize=0.8;
+        penwidth=1.2;
+    ];
+
+    // -------- Client --------
+    subgraph cluster_client {
+        label="Gemini Spark (custom Connected App)";
+        labeljust="l";
+        fontcolor="#6D28D9";
+        fontsize=11;
+        color="#E2E8F0";
+        style="filled,dashed";
+        fillcolor="#F5F3FF";
+
+        spark [label="Gemini Spark\n(MCP client, DCR + PKCE)", shape=box, fillcolor="#EDE9FE", color="#DDD6FE", fontcolor="#4C1D95"];
+    }
+
+    // -------- Single Cloud Run binary --------
+    subgraph cluster_server {
+        label="hello-spark-mcp  (single Go binary on Cloud Run)";
+        labeljust="l";
+        fontcolor="#047857";
+        fontsize=11;
+        color="#E2E8F0";
+        style="filled,dashed";
+        fillcolor="#ECFDF5";
+
+        subgraph cluster_public {
+            label="Public discovery (no auth)";
+            labeljust="l";
+            fontcolor="#0284C7";
+            fontsize=10;
+            color="#BAE6FD";
+            style="filled,dashed";
+            fillcolor="#F0F9FF";
+
+            prm  [label=".well-known/\noauth-protected-resource\n(RFC 9728)", shape=note, fillcolor="#E0F2FE", color="#BAE6FD", fontcolor="#0369A1"];
+            asm  [label=".well-known/\noauth-authorization-server\n(RFC 8414)", shape=note, fillcolor="#E0F2FE", color="#BAE6FD", fontcolor="#0369A1"];
+            reg  [label="/api/oauth/register\n(RFC 7591 DCR)", shape=note, fillcolor="#E0F2FE", color="#BAE6FD", fontcolor="#0369A1"];
+        }
+
+        subgraph cluster_authflow {
+            label="Consent + token (RFC 7636 PKCE)";
+            labeljust="l";
+            fontcolor="#B45309";
+            fontsize=10;
+            color="#FCD34D";
+            style="filled,dashed";
+            fillcolor="#FEF3C7";
+
+            authorize [label="/authorize\n(consent page)", shape=component, fillcolor="#FDE68A", color="#FCD34D", fontcolor="#78350F"];
+            token     [label="/api/oauth/token\n(PKCE exchange -> JWT)", shape=component, fillcolor="#FDE68A", color="#FCD34D", fontcolor="#78350F"];
+        }
+
+        gate [label="requireBearer\n(HMAC JWT verify, stateless)", shape=octagon, fillcolor="#FEE2E2", color="#FCA5A5", fontcolor="#991B1B", penwidth=2.0];
+
+        subgraph cluster_mcp {
+            label="MCP tool surface";
+            labeljust="l";
+            fontcolor="#047857";
+            fontsize=10;
+            color="#A7F3D0";
+            style="filled,dashed";
+            fillcolor="#F0FDF4";
+
+            mux  [label="/ and /mcp\nSSE + Streamable HTTP", shape=ellipse, fillcolor="#D1FAE5", color="#A7F3D0", fontcolor="#065F46"];
+            tool [label="echo tool\n(swap in your own)", shape=component, fillcolor="#D1FAE5", color="#A7F3D0", fontcolor="#065F46"];
+        }
+
+        store [label="in-memory stores\n(clients + auth codes)\n[production: use a DB]", shape=cylinder, fillcolor="#F1F5F9", color="#CBD5E1", fontcolor="#475569", style="filled,dashed"];
+    }
+
+    // -------- Edges: the discovery + auth dance --------
+    spark -> prm  [label=" 1. discover PRM", color="#0284C7"];
+    prm   -> asm  [label=" points to AS", color="#0284C7", style=dashed];
+    spark -> asm  [label=" 2. AS metadata", color="#0284C7"];
+    spark -> reg  [label=" 3. register (DCR)", color="#6D28D9"];
+    reg   -> store [label=" persist client", color="#475569", style=dashed];
+
+    spark     -> authorize [label=" 4. consent", color="#B45309"];
+    authorize -> store     [label=" issue code", color="#475569", style=dashed];
+    spark     -> token     [label=" 5. PKCE exchange", color="#B45309"];
+    token     -> store     [label=" consume code", color="#475569", style=dashed];
+
+    spark -> gate [label=" 6. Bearer JWT", color="#991B1B"];
+    gate  -> mux  [label=" verified", color="#047857"];
+    mux   -> tool;
+}

@@ -4,3 +4,13 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Local environment / secrets
+.env
+
+# Build output
+/bin/
+hello-mcp
+spark-agent-tools
+!spark-agent-tools/
+

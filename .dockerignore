@@ -1,0 +1,8 @@
+.git
+.beads
+.dolt
+*.db
+docs
+*.md
+.env
+/tmp
