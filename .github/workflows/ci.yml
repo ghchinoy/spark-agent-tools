@@ -46,12 +46,11 @@ jobs:
             exit 1
           fi
 
+      # Install golangci-lint via go install so it is built with the same Go
+      # toolchain as the project (avoiding binary Go-version mismatches).
+      # Pin to the v2 major so the .golangci.yml v2 config schema is honoured.
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: latest
-          # goinstall builds the linter from source using the Go toolchain
-          # already set up above, avoiding the "built with Go 1.24 < 1.25.5"
-          # binary compatibility error that occurs with pre-compiled releases.
-          install-mode: goinstall
-          args: --timeout=5m
+        run: golangci-lint run --timeout=5m
