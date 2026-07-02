@@ -14,3 +14,6 @@ hello-mcp
 spark-agent-tools
 !spark-agent-tools/
 
+# Onboarding screenshots (large PNGs, kept local only)
+docs/hello-world-spark-onboard/
+
