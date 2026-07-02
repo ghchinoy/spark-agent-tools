@@ -245,6 +245,43 @@ key) so the same `client_id` survives restarts.
 
 ---
 
+## 10. Spark requires explicit per-tool-call user confirmation
+
+Spark presents a confirmation UI to the user **before every individual tool call**
+— the user must click Allow or Deny in the browser before the HTTP request reaches
+your server. This is a deliberate client-side "human in the loop" safety policy and
+cannot be changed from the server side.
+
+From Google's docs: *"Currently, Gemini requires manual confirmation for any write
+actions."* In practice this applies to all tool calls, read or write.
+
+The consequence is visible in server logs: each tool call appears as a separate
+cluster with multi-second gaps between them — not because the server is slow, but
+because the gaps are the user's click latency. Our tool calls execute in 2–90ms;
+the server is idle waiting for the human to approve.
+
+```
+14:49:11  enquire_lexicon: wild         ← user clicked Allow
+14:50:08  enquire_lexicon: disorder     ← 57s gap = user clicked Allow
+14:50:38  enquire_lexicon: rúcina       ← 30s gap
+14:51:04  enquire_lexicon: RUK          ← 26s gap
+14:52:06  get_word_details: '92766143'  ← 37s gap
+```
+
+A question that requires 8 tool calls to answer fully requires 8 separate clicks.
+**Design implications:**
+- For research-heavy tools, minimize the number of round trips — Spark's latency is
+  dominated by click latency, not network or server time.
+- Prefer tools with broad, expressive queries over many narrow lookups. One
+  well-designed tool call that returns rich results beats four narrow ones.
+- Describe tools clearly: Spark shows the tool name and arguments to the user before
+  they approve. A clear tool name (`enquire_lexicon`) and legible argument values
+  (`query='star', language='q'`) build user trust and reduce hesitation-clicks.
+- Clients like opencode use session-level trust (OAuth connection = blanket approval)
+  and produce a very different call pattern — no gaps, all calls fire immediately.
+
+---
+
 ## Summary checklist for a production Spark-facing server
 
 - [ ] `GET /.well-known/oauth-protected-resource` returns 200 (bare path)
