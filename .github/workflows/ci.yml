@@ -49,8 +49,9 @@ jobs:
       # Install golangci-lint via go install so it is built with the same Go
       # toolchain as the project (avoiding binary Go-version mismatches).
       # Pin to the v2 major so the .golangci.yml v2 config schema is honoured.
+      # golangci-lint v2 uses the /v2 module path.
       - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
 
       - name: golangci-lint
         run: golangci-lint run --timeout=5m
