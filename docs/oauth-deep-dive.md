@@ -29,9 +29,9 @@ Two independent things are wrong, and they stack:
 1. Spark can't **discover** how to authenticate (the 404 storm).
 2. Even if it could, it can't **register** itself automatically (the error message).
 
-Modern MCP clients — Spark, opencode, Claude, and others — implement the current
-MCP Authorization spec, which is built on ordinary OAuth 2.1 discovery. Your
-server has to speak it.
+Modern MCP clients — Spark, opencode, Claude, and others — implement the
+[MCP Authorization spec](https://spec.modelcontextprotocol.io/specification/2025-03-26/basic/authorization/),
+which is built on ordinary OAuth 2.1 discovery. Your server has to speak it.
 
 ---
 
@@ -73,7 +73,7 @@ WWW-Authenticate: Bearer error="unauthorized",
   resource_metadata="https://your-server.example/.well-known/oauth-protected-resource"
 ```
 
-> In this repo: `handleProtectedResourceMetadata` and `challenge` in `oauth.go`.
+> In this repo: `handleProtectedResourceMetadata` and `challenge` in `pkg/mcpauth/mcpauth.go`.
 
 ---
 
@@ -106,7 +106,7 @@ Three fields matter most:
 - `token_endpoint_auth_methods_supported: ["none"]` — declares that clients are
   **public** (no client secret). Spark is a public client.
 
-> In this repo: `handleAuthServerMetadata` in `oauth.go`.
+> In this repo: `handleAuthServerMetadata` in `pkg/mcpauth/mcpauth.go`.
 
 ---
 
@@ -133,7 +133,7 @@ Key design choices for a Spark-facing server:
 - **Persist the client** (in production). This demo keeps it in memory, so a
   cold start makes Spark re-register — harmless, but noisy.
 
-> In this repo: `handleRegister` + `validateRedirectURI` in `oauth.go`.
+> In this repo: `handleRegister` + `validateRedirectURI` in `pkg/mcpauth/mcpauth.go`.
 
 ### DCR vs. CIMD (a fork in the road)
 
@@ -142,7 +142,7 @@ There are two ways a client can obtain an identity:
 | Mechanism | `client_id` shape | Who uses it |
 | :--- | :--- | :--- |
 | **DCR** (RFC 7591) | opaque string the server issues | **Gemini Spark**, most standard OAuth clients |
-| **CIMD** (Client ID Metadata Document) | an HTTPS URL the client hosts | opncode and other CIMD-aware agents |
+| **CIMD** (Client ID Metadata Document) | an HTTPS URL the client hosts | opencode and other CIMD-aware agents |
 
 They're interchangeable front doors that converge on the same token flow. This
 tutorial implements **DCR** because that's what Spark speaks. A server can
@@ -183,7 +183,7 @@ client secret.
 From then on the client sends `Authorization: Bearer eyJ…` with every MCP call,
 and your middleware validates the signature locally — no database hit per request.
 
-> In this repo: `handleAuthorize`, `handleToken`, `requireBearer` in `oauth.go`.
+> In this repo: `handleAuthorize`, `handleToken`, `RequireBearer` in `pkg/mcpauth/mcpauth.go`.
 
 ---
 
@@ -202,7 +202,7 @@ Mount your MCP handler at the exact root (`/{$}` in Go's `net/http`, which match
 auth challenge (which also carries the `resource_metadata` pointer from Step 1),
 and users can paste either the bare domain or `.../mcp`. Unknown paths still 404.
 
-> In this repo: the `mux.Handle("/{$}", secured)` line in `main.go`.
+> In this repo: the `mux.Handle("/{$}", secured)` line in `hello-world/main.go`.
 
 ---
 
@@ -254,10 +254,10 @@ the same RFC stack serving both MCP *and* A2A from one binary.
 
 ## Reference
 
-- MCP Authorization spec — https://modelcontextprotocol.io
-- RFC 9728 — OAuth 2.0 Protected Resource Metadata
-- RFC 8414 — OAuth 2.0 Authorization Server Metadata
-- RFC 7591 — OAuth 2.0 Dynamic Client Registration
-- RFC 7636 — Proof Key for Code Exchange (PKCE)
-- RFC 8252 — OAuth 2.0 for Native Apps (loopback redirect matching)
-- Gemini Spark — connect custom apps: https://support.google.com/gemini/answer/17209137
+- [MCP Authorization spec](https://spec.modelcontextprotocol.io/specification/2025-03-26/basic/authorization/)
+- [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) — OAuth 2.0 Protected Resource Metadata
+- [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) — OAuth 2.0 Authorization Server Metadata
+- [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591) — OAuth 2.0 Dynamic Client Registration
+- [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) — Proof Key for Code Exchange (PKCE)
+- [RFC 8252](https://www.rfc-editor.org/rfc/rfc8252) — OAuth 2.0 for Native Apps (loopback redirect matching)
+- [Gemini Spark — add a custom app](https://support.google.com/gemini/answer/17209137)
