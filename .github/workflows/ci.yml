@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    name: build · test · lint
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        # Keep in sync with go.mod. Using a range lets dependabot bump cleanly.
+        go-version: ["1.25.x"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Tidy (go.mod must be clean)
+        run: go mod tidy && git diff --exit-code go.mod go.sum
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Format check
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
