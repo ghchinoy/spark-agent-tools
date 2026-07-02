@@ -39,53 +39,79 @@ DCR). Don't conflate them.
 
 ## 2. The exact request sequence Spark sends
 
-From Cloud Run logs, a successful first connection (hello-world-spark, 2026-07-02):
+From Cloud Run logs with MCP method logging enabled (hello-world-spark,
+2026-07-02). The OAuth leg is identical every connection; the MCP protocol
+sequence is what `logMCPMethod` makes visible for the first time.
+
+### OAuth leg (every new connection)
 
 ```
-15:27:05  HEAD /                                           401   UA: Google    (initial probe; 401 + resource_metadata pointer)
-15:27:05  GET  /.well-known/oauth-protected-resource       200   UA: Google    (RFC 9728 PRM)
-15:27:05  GET  /.well-known/oauth-authorization-server     200   UA: Google    (RFC 8414 ASM; finds registration_endpoint)
-15:27:06  POST /api/oauth/register                         201   UA: OpenAuth  (RFC 7591 DCR; name="Google", 6 redirect_uris)
-15:27:47  GET  /authorize?…&resource=…&code_challenge=…    200   UA: Mozilla   (user's browser renders consent page)
-15:28:05  POST /authorize                                   302   UA: Mozilla   (user clicked Approve; code issued)
-15:28:06  POST /api/oauth/token?resource=…                 200   UA: OpenAuth  (PKCE exchange; JWT issued)
-15:28:07  POST /                                            200   UA: Google    (MCP initialize)
-15:28:07  POST /                                            202   UA: Google    (async message; response follows on GET stream)
-15:28:07  GET  /                                                  UA: Google    (SSE stream open)
-15:28:08  HEAD /                                           401   UA: Google    (mid-session re-probe; see §3)
-15:28:08  GET  /.well-known/oauth-protected-resource       200   UA: Google
-15:28:08  GET  /.well-known/oauth-authorization-server     200   UA: Google
-          … further tool calls on POST / …
-15:30:26  POST /                                            200   UA: Google
-          [tool] echo: "hi there"
+16:18:16  HEAD /                                           401   UA: Google    (initial probe; gets resource_metadata pointer)
+16:18:16  GET  /.well-known/oauth-protected-resource       200   UA: Google    (RFC 9728 PRM)
+16:18:16  GET  /.well-known/oauth-authorization-server     200   UA: Google    (RFC 8414 ASM; finds registration_endpoint)
+16:18:16  POST /api/oauth/register                         201   UA: OpenAuth  (RFC 7591 DCR; name="Google", 6 redirect_uris)
+16:18:21  GET  /authorize?…&resource=…&code_challenge=…    200   UA: Mozilla   (user's browser; consent page + favicon)
+16:18:22  POST /authorize                                   302   UA: Mozilla   (user clicked Approve; code issued)
+16:18:22  POST /api/oauth/token?resource=…                 200   UA: OpenAuth  (PKCE exchange; JWT issued)
 ```
 
-Key observations:
+### MCP protocol leg (per conversation turn)
 
-- Spark uses **three distinct User-Agents**, not two:
-  - `Google` — background probes (`HEAD /`), well-known discovery, and all MCP
-    tool calls
-  - `OpenAuth` — DCR registration (`POST /api/oauth/register`) and token
-    exchange (`POST /api/oauth/token`)
-  - `Mozilla/5.0` (the user's actual browser) — the `/authorize` consent page
-    (`GET` and `POST`)
+Each turn starts with a fresh `initialize` cycle — Spark does not maintain a
+long-lived MCP session across turns. With `logMCPMethod` enabled:
 
-  Filter logs by `userAgent:"OpenAuth"` to isolate the OAuth leg; filter by
-  `userAgent:"Google"` to see tool traffic. The browser leg only appears during
-  the one-time consent step.
+```
+16:18:23  POST /  200  [mcp] initialize              ← turn setup, connection A
+16:18:23  POST /  202  [mcp] notifications/initialized   GET / stream open (A)
+16:18:23  POST /  200  [mcp] initialize              ← turn setup, connection B (parallel)
+16:18:23  POST /  202  [mcp] notifications/initialized   GET / stream open (B)
+16:18:23  POST /  200  [mcp] tools/list              ← Spark fetches available tools
+          ── mid-session re-probe (HEAD / → 401 + well-known × 2) ──
+16:18:52  POST /  200  [mcp] initialize              ← tool-call turn (single connection)
+16:18:52  POST /  202  [mcp] notifications/initialized   GET / stream open
+16:18:52  POST /  200  [mcp] tools/call echo         ← actual tool invocation
+16:18:52          [tool] echo: "how's it going there?"
+16:18:52  POST /  200  [mcp] tools/list              ← Spark refreshes tool list after call
+```
 
-- The `?resource=` query parameter appears on **both** the `/authorize` and
-  `/api/oauth/token` requests (RFC 8707 Resource Indicators). Accept and ignore
-  it — don't reject it as an unexpected field.
+### Key observations
 
-- Spark registered with `client_name: "Google"` and sent **6 `redirect_uris`**,
-  all pointing to `https://oauth-redirect.googleusercontent.com/r/…`. Accept them
-  all; don't cap at a number lower than 6. These are `https` URIs, so standard
+- Spark uses **three distinct User-Agents**:
+  - `Google` — background probes (`HEAD /`), well-known discovery, all MCP traffic
+  - `OpenAuth` — DCR registration and token exchange
+  - `Mozilla/5.0` — the `/authorize` consent page (browser only, one-time)
+
+- **`initialize` is called on every turn, not once per session.** Spark treats
+  each conversation turn as a fresh MCP session: `initialize` →
+  `notifications/initialized` → `tools/list`, then the actual tool call. There
+  is no long-lived session reuse across turns.
+
+- **Spark opens two parallel MCP connections on some turns.** Two `initialize` +
+  `notifications/initialized` pairs appear simultaneously at the start of certain
+  turns, each opening its own GET stream. Simpler turns use a single connection.
+  The pattern likely reflects how many parallel Spark agent workers a given turn
+  requires.
+
+- **`notifications/initialized`** is correctly sent by Spark after receiving the
+  `initialize` response — the post-init notification the MCP spec requires. It
+  returns `202` and opens the GET stream.
+
+- **`tools/list` is called twice per turn** — once immediately after `initialize`
+  (to populate the tool inventory) and again after each `tools/call` (to refresh).
+
+- **`prompts/list` is never called.** Across every session observed, Spark does
+  not call `prompts/list` even though the server advertises the `prompts`
+  capability in `initialize`. See §14.
+
+- The `?resource=` query parameter appears on both `/authorize` and
+  `/api/oauth/token` (RFC 8707 Resource Indicators). Accept and ignore it.
+
+- Spark registered with `client_name: "Google"` and **6 `redirect_uris`** pointing
+  to `https://oauth-redirect.googleusercontent.com/r/…`. All are `https`; standard
   redirect-URI validation passes without special-casing.
 
-- Tool calls land on **`POST /`** (the root endpoint), not on a named path like
-  `/mcp`. The `/{$}` exact-root mount in `main.go` is not cosmetic — without it,
-  Spark's tool calls 404.
+- Tool calls land on **`POST /`** (the root). The `/{$}` exact-root mount in
+  `main.go` is not cosmetic — without it, Spark's tool calls 404.
 
 ---
 
@@ -542,20 +568,69 @@ Spark's Connected Apps UI (as of July 2026):
 - **`Title`** — present in the `initialize` response. Spark's UI shows the
   Cloud Run service name, not the `Implementation.Title`.
 - **`Instructions`** — present in the `initialize` response. Not visible in
-  the Spark UI; likely consumed by the LLM context rather than rendered.
-- **`prompts/list`** — the server advertises the `prompts` capability in
-  `initialize`. Whether Spark calls `prompts/list` requires MCP method logging
-  to confirm (HTTP logs alone cannot tell you). No prompt-related UI appeared.
+  the Spark UI as rendered text, but **confirmed consumed by the LLM.** When
+  asked to use the echo tool for a weather query, Spark's Gemini LLM populated
+  the `message` argument with real weather data for Fort Collins, CO —
+  demonstrating it understood from `Instructions` and `Description` that echo
+  is a pass-through. The field shapes LLM behavior even when invisible to users.
+- **`prompts/list`** — **confirmed never called.** The server advertises the
+  `prompts` capability in `initialize` and registers example prompts. Across
+  every session observed with MCP method logging enabled, Spark never issues
+  `prompts/list`. The prompts capability is silently ignored.
 - **`service_documentation`** (RFC 8414) — present in AS metadata which Spark
   fetches. Not surfaced in Spark's Connected Apps UI.
 
-These fields are **correct per the MCP spec** and worth setting for other
-clients (Claude Desktop, opencode) that do read them. They are also
-forward-compatible — Spark may surface them in future releases.
+These fields are **correct per the MCP spec** and worth setting — other clients
+(Claude Desktop, opencode) do read them, and `Instructions` demonstrably
+influences LLM reasoning even in Spark. They are forward-compatible with future
+Spark UI improvements.
 
 ---
 
-## 13. Spark may respond in an unexpected language regardless of user locale
+## 15. Spark's LLM uses tool descriptions to reason about tool use — including creatively
+
+The `Tool.Description` field is not just a hint to the LLM for when to call a
+tool. It also shapes *how* the LLM calls it. When asked to use the echo tool to
+answer "What's the weather in Fort Collins now?", Spark's Gemini LLM:
+
+1. Recognized from the description that echo returns whatever you put in.
+2. Fetched the current weather from its own knowledge (Fort Collins, CO, July 2,
+   2026: sunny, 74°F, Air Quality Alert, high of 93–95°F).
+3. Called `tools/call echo` with that information as the `message` argument.
+4. Presented the echoed result as the tool's response.
+
+The actual log entry:
+
+```
+[mcp] tools/call echo
+[tool] echo: "The current weather in Fort Collins, CO on July 2, 2026 is sunny
+with some patchy smoke due to an active Air Quality Alert. The temperature is
+currently around 74°F and is expected to reach a high of 93°F to 95°F later today."
+```
+
+The LLM used echo as a delivery mechanism for information it already had —
+satisfying the user's literal request ("use the same tool") while answering the
+actual question. The `Instructions` field on the server and the `Description`
+on the tool were both demonstrably read and reasoned about.
+
+**Design implications:**
+
+- Write `Description` for the LLM, not just for documentation. The LLM reasons
+  from it about when and how to call the tool, including in unexpected ways.
+- Write `Instructions` on the server to scope what the LLM should expect from
+  the connection — "this is a hello-world/test server" is meaningful context that
+  shapes the LLM's behaviour.
+- Spark's Gemini LLM will adapt tool use to satisfy user intent even when the
+  tool's function doesn't literally match the request. Design tool descriptions
+  that make the tool's actual behavior unambiguous to avoid misuse.
+
+The long tail of `POST / → 202` entries (~55 seconds, 15+ messages) after the
+tool call is Spark streaming its full composed response — incorporating the echoed
+weather data alongside the LLM's own commentary explaining what it did.
+
+---
+
+## 16. Spark may respond in an unexpected language regardless of user locale
 
 After a successful multi-tool research session that produced genuine, linguistically
 correct Tolkien-language neologisms, Spark delivered the entire response in
