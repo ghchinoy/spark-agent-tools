@@ -39,31 +39,53 @@ DCR). Don't conflate them.
 
 ## 2. The exact request sequence Spark sends
 
-From Cloud Run logs (User-Agent: `Google` / `OpenAuth`), a successful first
-connection looks like this:
+From Cloud Run logs, a successful first connection (hello-world-spark, 2026-07-02):
 
 ```
-HEAD /sse                                         401   UA: Google    (probe)
-GET  /.well-known/oauth-protected-resource        200   UA: Google    (RFC 9728)
-GET  /.well-known/oauth-authorization-server      200   UA: Google    (RFC 8414)
-POST /api/oauth/register                          201   UA: OpenAuth  (RFC 7591 DCR)
-  … user sees consent page, signs in …
-POST /api/oauth/authorize-callback                200   UA: Chrome    (consent approved)
-POST /api/oauth/token?resource=…/sse              200   UA: OpenAuth  (PKCE exchange)
-POST /sse  (Authorization: Bearer eyJ…)           200   UA: Google    (tool calls)
-POST /sse  (Authorization: Bearer eyJ…)           200   UA: Google
+15:27:05  HEAD /                                           401   UA: Google    (initial probe; 401 + resource_metadata pointer)
+15:27:05  GET  /.well-known/oauth-protected-resource       200   UA: Google    (RFC 9728 PRM)
+15:27:05  GET  /.well-known/oauth-authorization-server     200   UA: Google    (RFC 8414 ASM; finds registration_endpoint)
+15:27:06  POST /api/oauth/register                         201   UA: OpenAuth  (RFC 7591 DCR; name="Google", 6 redirect_uris)
+15:27:47  GET  /authorize?…&resource=…&code_challenge=…    200   UA: Mozilla   (user's browser renders consent page)
+15:28:05  POST /authorize                                   302   UA: Mozilla   (user clicked Approve; code issued)
+15:28:06  POST /api/oauth/token?resource=…                 200   UA: OpenAuth  (PKCE exchange; JWT issued)
+15:28:07  POST /                                            200   UA: Google    (MCP initialize)
+15:28:07  POST /                                            202   UA: Google    (async message; response follows on GET stream)
+15:28:07  GET  /                                                  UA: Google    (SSE stream open)
+15:28:08  HEAD /                                           401   UA: Google    (mid-session re-probe; see §3)
+15:28:08  GET  /.well-known/oauth-protected-resource       200   UA: Google
+15:28:08  GET  /.well-known/oauth-authorization-server     200   UA: Google
+          … further tool calls on POST / …
+15:30:26  POST /                                            200   UA: Google
+          [tool] echo: "hi there"
 ```
 
 Key observations:
-- Spark uses **two different User-Agents**: `OpenAuth` for the OAuth leg (DCR
-  registration and token exchange), `Google` for everything else including tool
-  calls.
-- The token endpoint is called with a `?resource=` query parameter (e.g.
-  `?resource=https://your-server.example/sse`). Your token handler must accept
-  (and can safely ignore) this parameter — don't reject it as an unexpected field.
-- Spark registered with `client_name: "Google"` and sent **6 `redirect_uris`**
-  covering its various callback surfaces. Accept them all; don't cap at a number
-  lower than 6.
+
+- Spark uses **three distinct User-Agents**, not two:
+  - `Google` — background probes (`HEAD /`), well-known discovery, and all MCP
+    tool calls
+  - `OpenAuth` — DCR registration (`POST /api/oauth/register`) and token
+    exchange (`POST /api/oauth/token`)
+  - `Mozilla/5.0` (the user's actual browser) — the `/authorize` consent page
+    (`GET` and `POST`)
+
+  Filter logs by `userAgent:"OpenAuth"` to isolate the OAuth leg; filter by
+  `userAgent:"Google"` to see tool traffic. The browser leg only appears during
+  the one-time consent step.
+
+- The `?resource=` query parameter appears on **both** the `/authorize` and
+  `/api/oauth/token` requests (RFC 8707 Resource Indicators). Accept and ignore
+  it — don't reject it as an unexpected field.
+
+- Spark registered with `client_name: "Google"` and sent **6 `redirect_uris`**,
+  all pointing to `https://oauth-redirect.googleusercontent.com/r/…`. Accept them
+  all; don't cap at a number lower than 6. These are `https` URIs, so standard
+  redirect-URI validation passes without special-casing.
+
+- Tool calls land on **`POST /`** (the root endpoint), not on a named path like
+  `/mcp`. The `/{$}` exact-root mount in `main.go` is not cosmetic — without it,
+  Spark's tool calls 404.
 
 ---
 
@@ -102,22 +124,62 @@ the logs noisy.
 
 ---
 
-## 4. Spark uses the Streamable HTTP transport, not SSE
+## 4. Spark may probe both Cloud Run URL forms before settling on one
 
-Despite the endpoint being named `/sse`, Spark uses the **Streamable HTTP MCP
-transport** (not the legacy SSE transport). In the multiplexer this means:
+Cloud Run services have two URL formats:
 
-- `POST /sse` — rapid RPC: Spark sends a tool request, server responds
-  immediately (2–5ms). Used for every tool call.
-- `GET /sse` — long-lived streaming connection: server pushes events to the
-  client. Spark holds this open for the duration of the session.
+```
+https://<service>-<random-hash>-uc.a.run.app          (region-scoped, shown in console)
+https://<service>-<numeric-project-id>.us-central1.run.app  (numeric project URL)
+```
 
-The `GET /sse` connections are what create the long-latency entries in Cloud Run
-logs. Which leads directly to the next lesson.
+In practice, Spark ran the full discovery + DCR sequence on the first URL, then
+switched to the second URL and ran it again:
+
+```
+15:24:11  POST /api/oauth/register  201  on syzu5sozjq-uc.a.run.app   (first URL)
+15:27:06  POST /api/oauth/register  201  on 308690897031.us-central1.run.app  (second URL)
+```
+
+Two registrations, two `client_id`s. The full auth flow and all tool calls then
+used the numeric URL.
+
+**Why it doesn't break things:** `requestBaseURL` derives the public origin from
+the incoming request's `Host` header (honoring `X-Forwarded-Host`), so both URL
+forms produce correct OAuth metadata — each registration and its subsequent token
+are self-consistent for the URL that issued them.
+
+**What it reveals about in-memory state:** if those two requests hit different
+Cloud Run instances, the second instance wouldn't know about the first
+registration. With a persistent store this is harmless; with in-memory state it
+works only because a single-instance deployment handled both. This is the most
+concrete illustration of why in-memory state is a demo limitation and not a
+production approach.
 
 ---
 
-## 5. Cloud Run's default 300-second timeout kills long-lived streaming connections
+## 5. Spark uses the Streamable HTTP transport, not SSE
+
+Spark uses the **Streamable HTTP MCP transport** (not the legacy SSE transport),
+and it hits the **root endpoint `/`**, not a named path. In the multiplexer the
+pattern is:
+
+```
+POST /   200   rapid RPC — Spark sends a message, server responds synchronously
+POST /   202   async RPC — server accepted the message; response comes on the GET stream
+GET  /         long-lived SSE stream — server pushes responses for the 202 messages
+```
+
+The `202 Accepted` status means "I received your message; watch the GET stream
+for the response." You will see `POST / → 200` and `POST / → 202` interleaved
+in logs, with each `202` paired to a `GET /` SSE connection already open.
+
+`GET /` connections are what create long-latency entries in Cloud Run logs.
+Which leads directly to the next lesson.
+
+---
+
+## 6. Cloud Run's default 300-second timeout kills long-lived streaming connections
 
 **This is the most important production gotcha.**
 
@@ -152,7 +214,7 @@ every 5 minutes silently.
 
 ---
 
-## 6. CIMD and DCR coexist — run both, dispatch by client_id shape
+## 7. CIMD and DCR coexist — run both, dispatch by client_id shape
 
 opencode connected to the same server at the same time as Spark, using the CIMD
 (Client ID Metadata Document) mechanism instead of DCR. Both worked
@@ -180,7 +242,7 @@ Clients self-select the path they support. There is no need to choose one.
 
 ---
 
-## 7. Your consent SPA must handle opaque client_ids
+## 8. Your consent SPA must handle opaque client_ids
 
 If you build a browser-based consent page, do not assume `client_id` is always a
 URL. DCR-issued client_ids (e.g. `"mcp-client-tEQk1WspGqUaakNRS8vWFoWsjsm2GjPj"`)
@@ -212,7 +274,7 @@ regardless of shape. The backend's `resolveClient` function handles the dispatch
 
 ---
 
-## 8. Log filtering tips for Spark sessions
+## 9. Log filtering tips for Spark sessions
 
 | What you want to see | Filter |
 | :--- | :--- |
@@ -228,7 +290,7 @@ by both when debugging an end-to-end flow.
 
 ---
 
-## 9. What the DCR registration actually looks like in logs
+## 10. What the DCR registration actually looks like in logs
 
 When Spark registers for the first time you will see exactly one line like this:
 
@@ -245,7 +307,7 @@ key) so the same `client_id` survives restarts.
 
 ---
 
-## 10. Spark requires explicit per-tool-call user confirmation
+## 11. Spark requires explicit per-tool-call user confirmation
 
 Spark presents a confirmation UI to the user **before every individual tool call**
 — the user must click Allow or Deny in the browser before the HTTP request reaches
@@ -282,6 +344,96 @@ A question that requires 8 tool calls to answer fully requires 8 separate clicks
 
 ---
 
+## 12. The 409 Conflict on GET /sse: streaming channel conflicts and stuck sessions
+
+### What 409 means in Streamable HTTP
+
+In the MCP Streamable HTTP transport, `GET /sse` opens the server-to-client
+push channel — the half of the connection the server uses to deliver async
+responses. The MCP Go SDK enforces **one active GET stream per session ID**: if a
+second `GET /sse` arrives while one is already open for that session, it returns
+`409 Conflict`.
+
+In production logs this looks like a ~30–90 second heartbeat of 409s, interspersed
+with successful `POST /sse` tool calls:
+
+```
+15:38:17  GET /sse → 409
+15:38:21  POST /sse → 200   enquire_lexicon: 'mix'        ← tool call still works
+15:38:24  GET /sse → 409
+15:39:15  POST /sse → 200   enquire_lexicon: 'rúcina'     ← still works
+15:42:06  GET /sse → 409
+15:42:13  POST /sse → 200   get_derivations: '92766143'   ← still works
+```
+
+### Why tool calls still succeed despite 409s
+
+The Streamable HTTP protocol has two response paths:
+
+- **Synchronous (POST → 200):** The server writes the tool result directly into
+  the `POST` response body. No GET stream needed. Fast lexicon lookups almost
+  always take this path.
+- **Async (POST → 202 + GET stream):** The server acknowledges receipt via 202
+  and later pushes the result on the open GET stream.
+
+The 409 only breaks the async path. Read-only tool calls that complete in
+milliseconds (like `enquire_lexicon`) typically return 200 synchronously, so
+they succeed even when the GET stream is in conflict. The session stays
+functional for most tool calls while the 409s persist.
+
+### What causes the conflict
+
+The 409 pattern emerged during and after a Cloud Run **deployment rollout**. When
+traffic shifts from the old revision to the new one mid-session:
+
+1. Spark's existing GET stream, held open on the old instance, is killed as the
+   old instance drains.
+2. Spark immediately tries to reopen a GET stream on the new instance.
+3. The new instance has no record of this session, or — if `--session-affinity`
+   is set but a reconnect races with cleanup — the SDK still has a stale entry.
+4. Result: `404` (unknown session) or `409` (duplicate stream) on `GET /sse`.
+
+From the logs, immediately after the new revision started:
+
+```
+14:47:21  GET /sse → 404   (session ID unknown to new instance)
+14:47:22  GET /sse → 404
+14:47:24  Truncated response body   (old instance connections killed)
+           → Spark reconnects; subsequent GET /sse land as 409
+```
+
+### The stuck-session ("Thinking it through…") failure mode
+
+When the LLM finishes generating its response but needs to deliver it via a **202
+async path** and the GET stream is stuck in 409 conflict, the response is
+generated on the server but never reaches the client. Spark's UI shows the
+permanent "Thinking it through..." spinner:
+
+- The server has processed all tool calls successfully (all visible in logs).
+- No further `[Tool Call]` entries appear — the LLM has finished research.
+- `GET /sse → 409` repeats every ~60s — Spark polling for a stream it can't open.
+- No error surfaced to the user; it just never resolves.
+
+**Recovery:** disconnect and reconnect the Spark → server connection. This clears
+the session state on both sides and starts fresh.
+
+### Mitigations
+
+- **`--session-affinity`** (already in the deploy script): routes a client's
+  requests to the same Cloud Run instance, reducing the chance that a reconnect
+  hits a different instance with no session state.
+- **Avoid deployment rollouts mid-session**: Cloud Run's traffic-shifting during
+  deployment is the primary trigger. The `--no-traffic` flag lets you deploy a
+  new revision without immediately shifting traffic, then cut over when idle.
+- **Long-poll keepalives**: some MCP SDK configurations support periodic
+  heartbeat writes on the GET stream to prevent the server from treating it as
+  idle. Check the SDK's `StreamableHTTPHandlerOptions` for keepalive settings.
+- **Track 409 rate as a health signal**: a sustained 409 rate on `GET /sse` with
+  no new tool calls is a reliable indicator of a stuck session. A log-based alert
+  on this pattern would let you detect it without waiting for user reports.
+
+---
+
 ## Summary checklist for a production Spark-facing server
 
 - [ ] `GET /.well-known/oauth-protected-resource` returns 200 (bare path)
@@ -291,6 +443,7 @@ A question that requires 8 tool calls to answer fully requires 8 separate clicks
 - [ ] `POST /api/oauth/register` returns 201, no `client_secret`, accepts ≥ 6 `redirect_uris`
 - [ ] Token endpoint accepts (and ignores) the `?resource=` query parameter
 - [ ] Consent SPA handles opaque `client_id` strings without treating them as URLs
+- [ ] `requestBaseURL` derives origin from the request `Host` header, not a hardcoded value (both Cloud Run URL forms work without config)
 - [ ] `gcloud run deploy` uses `--timeout 3600` (not the default 300s)
 - [ ] `--session-affinity` is set for Cloud Run (keeps streaming sessions on one instance)
-- [ ] Registered clients are persisted across cold starts
+- [ ] Registered clients are persisted across cold starts (in-memory state re-registers on every cold start and on each Cloud Run URL form Spark probes)
