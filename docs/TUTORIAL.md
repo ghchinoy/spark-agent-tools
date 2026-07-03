@@ -233,6 +233,7 @@ mcpauth.NewAuthServer(mcpauth.Options{
     ServiceDocumentationURI: "https://github.com/ghchinoy/spark-agent-tools",
     PolicyURI:               "https://example.com/privacy",  // RFC 8414 op_policy_uri
     TOSURI:                  "https://example.com/terms",    // RFC 8414 op_tos_uri
+    TokenTTL:                30 * 24 * time.Hour,            // Prevent client lockouts on expiration
 })
 ```
 
@@ -240,6 +241,8 @@ mcpauth.NewAuthServer(mcpauth.Options{
 `PolicyURI` and `TOSURI` appear in both AS metadata and DCR registration responses
 (`policy_uri`, `tos_uri`). Other MCP clients read these even if Spark doesn't
 currently surface them in its UI.
+
+`TokenTTL` defines the lifetime of issued access tokens (defaults to 30 days). Since Spark's current custom app client does not automatically trigger re-authorization or refresh loops when a token expires (which results in an empty tools panel and locked out session), configuring a long-lived `TokenTTL` ensures seamless connectivity for developers.
 
 ### Favicon
 

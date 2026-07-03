@@ -158,6 +158,15 @@ treats it as idle. Without it, an idle stream can close and reopen, and the SDK
 rejects the reopened stream with a `409 Conflict` that leaves Spark stuck on a
 "Thinking it through…" spinner. One line, no downside.
 
+**Give issued tokens a generous lifetime (e.g., 30 days) for development.**
+Under standard OAuth, when a short-lived token expires (like the standard 1-hour
+TTL), the client uses a refresh token or prompts for re-authorization. Currently,
+Spark's custom app client does not automatically trigger a re-authorization flow when
+it receives a `401`. Instead, it gets stuck trying to use the expired token, and the
+tools panel goes blank. The only way to recover is to remove and re-add the app.
+To bypass this client-side limitation, `pkg/mcpauth` defaults issued tokens to a
+**30-day lifetime** so your server keeps running seamlessly during development.
+
 **Icons, prompts, and `Instructions` are MCP-general.** The MCP spec supports
 `Icons`, `Title`, and `WebsiteURL` on servers and tools, a server-level
 `Instructions` string, and discoverable `prompts`. Set them. Spark's current UI
