@@ -662,6 +662,29 @@ and the language of the original question.
 
 ---
 
+## 17. Spark client does not silently recover from token expiration (re-auth failure)
+
+When a Bearer access token expires (such as after the standard 1-hour TTL), subsequent requests from Spark will hit your server and fail with a **`401 Unauthorized`**. 
+
+In an ideal OAuth flow, an expired token triggers silent token refresh or prompts the user to re-authorize in the UI. However, Spark's current client does not silently recover or automatically restart the OAuth consent flow when it receives a `401`. Instead:
+- It gets stuck trying to use the expired token over and over.
+- The tools list in Spark's Connected Apps info panel becomes empty.
+- The server remains completely unreachable for any further tool calls.
+- The only recovery path for the user is to completely remove the custom app from the Connected Apps panel and re-add it from scratch to force a brand-new DCR and consent flow.
+
+### Mitigations
+
+- **Configure extremely generous Token TTLs for development / tutorial servers:** To prevent this loop from constantly disrupting development or demo use, make the issued access token's lifetime significantly longer (e.g., **30 days** or more). The `pkg/mcpauth` package implements a `TokenTTL` option (defaulting to 30 days) to completely prevent tokens from expiring during development:
+  ```go
+  authz := mcpauth.NewAuthServer(mcpauth.Options{
+      ServerName: "My Server",
+      TokenTTL:   30 * 24 * time.Hour, // 30 days
+  })
+  ```
+- **Ensure stable signing keys:** Pin your `JWT_SIGNING_KEY` in your `.env` config. Sourcing a new key on every deployment invalidates all outstanding tokens immediately, triggering this re-auth failure loop for all active sessions.
+
+---
+
 ## Summary checklist for a production Spark-facing server
 
 - [ ] `GET /.well-known/oauth-protected-resource` returns 200 (bare path)
@@ -672,8 +695,9 @@ and the language of the original question.
 - [ ] Token endpoint accepts (and ignores) the `?resource=` query parameter
 - [ ] Consent SPA handles opaque `client_id` strings without treating them as URLs
  - [ ] `requestBaseURL` derives origin from the request `Host` header, not a hardcoded value (both Cloud Run URL forms work without config)
- - [ ] `JWT_SIGNING_KEY` is pinned in the deploy config — a rotated key invalidates all existing tokens; Spark's re-enable flow does not restart OAuth automatically
- - [ ] `mcp.ServerOptions{KeepAlive: 30 * time.Second}` passed to `mcp.NewServer` (prevents GET stream idle closure → 409 conflict)
+  - [ ] `JWT_SIGNING_KEY` is pinned in the deploy config — a rotated key invalidates all existing tokens; Spark's re-enable flow does not restart OAuth automatically
+  - [ ] Configure long-lived `TokenTTL` (e.g. 30 days) to prevent Spark from silently getting locked out when tokens expire
+  - [ ] `mcp.ServerOptions{KeepAlive: 30 * time.Second}` passed to `mcp.NewServer` (prevents GET stream idle closure → 409 conflict)
  - [ ] `gcloud run deploy` uses `--timeout 3600` (not the default 300s)
  - [ ] `--session-affinity` is set for Cloud Run (keeps streaming sessions on one instance)
  - [ ] Use `--no-traffic` when deploying while sessions are active; cut over manually with `update-traffic --to-latest`

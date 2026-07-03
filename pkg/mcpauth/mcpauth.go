@@ -185,19 +185,27 @@ type Options struct {
 	// RFC 7591 "tos_uri"). Included in AS metadata and DCR responses if
 	// non-empty.
 	TOSURI string
+
+	// TokenTTL is the lifetime of issued access tokens. Defaults to 24 * time.Hour.
+	// For production, short lifetimes are recommended. For local/tutorial use,
+	// a longer TTL (e.g., 30 days or more) prevents Spark from getting stuck
+	// when tokens expire, as Spark's current client does not automatically
+	// refresh or re-authorize expired tokens silently.
+	TokenTTL time.Duration
 }
 
 // AuthServer is a minimal, self-contained OAuth 2.1 authorization server AND
 // resource server. Configure it with Options and mount it with Mount.
 type AuthServer struct {
-	jwtKey  []byte
-	store   Store
-	resolve ResolveSubjectFunc
-	scope   string
-	name    string
-	docURI  string
-	policy  string
-	tos     string
+	jwtKey   []byte
+	store    Store
+	resolve  ResolveSubjectFunc
+	scope    string
+	name     string
+	docURI   string
+	policy   string
+	tos      string
+	tokenTTL time.Duration
 }
 
 // NewAuthServer constructs an AuthServer from the provided Options.
@@ -228,15 +236,21 @@ func NewAuthServer(opts Options) *AuthServer {
 		name = "MCP server"
 	}
 
+	tokenTTL := opts.TokenTTL
+	if tokenTTL == 0 {
+		tokenTTL = 720 * time.Hour // Default to 30 days (720 hours) for robust local/demo use
+	}
+
 	return &AuthServer{
-		jwtKey:  []byte(key),
-		store:   store,
-		resolve: opts.ResolveSubject,
-		scope:   scope,
-		name:    name,
-		docURI:  opts.ServiceDocumentationURI,
-		policy:  opts.PolicyURI,
-		tos:     opts.TOSURI,
+		jwtKey:   []byte(key),
+		store:    store,
+		resolve:  opts.ResolveSubject,
+		scope:    scope,
+		name:     name,
+		docURI:   opts.ServiceDocumentationURI,
+		policy:   opts.PolicyURI,
+		tos:      opts.TOSURI,
+		tokenTTL: tokenTTL,
 	}
 }
 
@@ -647,7 +661,7 @@ func (s *AuthServer) handleToken(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	token, err := s.issueJWT(ac.Subject, clientID, requestBaseURL(r), time.Hour)
+	token, err := s.issueJWT(ac.Subject, clientID, requestBaseURL(r), s.tokenTTL)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "server_error", "error_description": "failed to sign token",
@@ -658,7 +672,7 @@ func (s *AuthServer) handleToken(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, tokenResponse{
 		AccessToken: token,
 		TokenType:   "Bearer",
-		ExpiresIn:   3600,
+		ExpiresIn:   int(s.tokenTTL.Seconds()),
 		Scope:       s.scope,
 	})
 }
