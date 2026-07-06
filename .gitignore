@@ -17,3 +17,6 @@ spark-agent-tools
 # Onboarding screenshots (large PNGs, kept local only)
 docs/hello-world-spark-onboard/
 
+# Friction reports (kept local, do not check in)
+docs/friction/
+
