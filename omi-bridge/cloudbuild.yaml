@@ -1,0 +1,21 @@
+# Cloud Build config for omi-bridge.
+#
+# `gcloud run deploy --source .` always builds whatever file is literally
+# named "Dockerfile" at the root of the uploaded source — it has no
+# --dockerfile or --build-arg flag to select a different one. Since this repo
+# has two deployable apps (hello-world/, omi-bridge/) sharing one go.mod, we
+# build explicitly with `-f omi-bridge/Dockerfile` while keeping the build
+# context at the repo root (so `COPY . .` in that Dockerfile sees go.mod/go.sum/pkg/mcpauth).
+#
+# Used by omi-bridge/scripts/deploy.sh.
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "-f"
+      - "omi-bridge/Dockerfile"
+      - "-t"
+      - "${_IMAGE}"
+      - "."
+images:
+  - "${_IMAGE}"

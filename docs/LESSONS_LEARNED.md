@@ -685,6 +685,35 @@ In an ideal OAuth flow, an expired token triggers silent token refresh or prompt
 
 ---
 
+## 18. OAuth consent denial returns a generic Google 500 error page
+
+When an end-user denies access on the `/authorize` consent screen (e.g., clicking **Cancel** or entering an invalid passphrase), RFC 6749 §4.1.2 requires the authorization server to redirect back to the client's `redirect_uri` with an `error=access_denied` parameter:
+
+```
+302 Redirect -> https://oauth-redirect.googleusercontent.com/r/...&error=access_denied&state=...
+```
+
+Our server logs confirmed the authorization server issued this redirect correctly:
+```
+17:51:07 [req] POST /authorize (UA: Mozilla/5.0 ...)
+17:51:07 [auth] Invalid passphrase provided during consent attempt
+17:51:07 HTTP 302 -> https://oauth-redirect.googleusercontent.com/r/...
+```
+
+However, Spark's callback handler at `oauth-redirect.googleusercontent.com` does not surface this error reason to the user. Instead of rendering a user-friendly message (such as *"Access was denied by the authorization server"*), Spark displays a generic Google error page:
+
+> **500. That's an error.**
+> There was an error. Please try again later. That’s all we know.
+
+Inferred from server logs and timing correlation during live bridge testing: the 500 status page originates from Spark's callback endpoint handling the `error=access_denied` parameter, not from an unhandled error inside the custom MCP server itself.
+
+### Impact & Mitigations
+
+- **Misleading debugging signal:** Developers testing custom OAuth flows may assume the 500 page indicates a server crash or 500 Internal Server Error in their own backend code, when in fact their backend successfully returned 302. Always check Cloud Run logs to verify whether the 302 redirect occurred.
+- **Clear UI guidance on custom consent pages:** To reduce user confusion, ensure your consent page clearly validates user inputs (like passphrases) client-side before submission, preventing unnecessary `access_denied` redirects where possible.
+
+---
+
 ## Summary checklist for a production Spark-facing server
 
 - [ ] `GET /.well-known/oauth-protected-resource` returns 200 (bare path)
@@ -694,13 +723,14 @@ In an ideal OAuth flow, an expired token triggers silent token refresh or prompt
 - [ ] `POST /api/oauth/register` returns 201, no `client_secret`, accepts ≥ 6 `redirect_uris`
 - [ ] Token endpoint accepts (and ignores) the `?resource=` query parameter
 - [ ] Consent SPA handles opaque `client_id` strings without treating them as URLs
- - [ ] `requestBaseURL` derives origin from the request `Host` header, not a hardcoded value (both Cloud Run URL forms work without config)
-  - [ ] `JWT_SIGNING_KEY` is pinned in the deploy config — a rotated key invalidates all existing tokens; Spark's re-enable flow does not restart OAuth automatically
-  - [ ] Configure long-lived `TokenTTL` (e.g. 30 days) to prevent Spark from silently getting locked out when tokens expire
-  - [ ] `mcp.ServerOptions{KeepAlive: 30 * time.Second}` passed to `mcp.NewServer` (prevents GET stream idle closure → 409 conflict)
- - [ ] `gcloud run deploy` uses `--timeout 3600` (not the default 300s)
- - [ ] `--session-affinity` is set for Cloud Run (keeps streaming sessions on one instance)
- - [ ] Use `--no-traffic` when deploying while sessions are active; cut over manually with `update-traffic --to-latest`
- - [ ] Registered clients are persisted across cold starts (in-memory state re-registers on every cold start and on each Cloud Run URL form Spark probes)
- - [ ] `DELETE / → 401` is expected and harmless — Spark omits `Authorization` on session teardown requests; do not treat as an auth failure
- - [ ] MCP method logging added (`logMCPMethod` wrapper) so `POST /` lines show the actual protocol method (`initialize`, `tools/list`, `tools/call echo`, etc.)
+- [ ] `requestBaseURL` derives origin from the request `Host` header, not a hardcoded value (both Cloud Run URL forms work without config)
+- [ ] `JWT_SIGNING_KEY` is pinned in the deploy config — a rotated key invalidates all existing tokens; Spark's re-enable flow does not restart OAuth automatically
+- [ ] Configure long-lived `TokenTTL` (e.g. 30 days) to prevent Spark from silently getting locked out when tokens expire
+- [ ] `mcp.ServerOptions{KeepAlive: 30 * time.Second}` passed to `mcp.NewServer` (prevents GET stream idle closure → 409 conflict)
+- [ ] `gcloud run deploy` uses `--timeout 3600` (not the default 300s)
+- [ ] `--session-affinity` is set for Cloud Run (keeps streaming sessions on one instance)
+- [ ] Use `--no-traffic` when deploying while sessions are active; cut over manually with `update-traffic --to-latest`
+- [ ] Registered clients are persisted across cold starts (in-memory state re-registers on every cold start and on each Cloud Run URL form Spark probes)
+- [ ] `DELETE / → 401` is expected and harmless — Spark omits `Authorization` on session teardown requests; do not treat as an auth failure
+- [ ] MCP method logging added (`logMCPMethod` wrapper) so `POST /` lines show the actual protocol method (`initialize`, `tools/list`, `tools/call echo`, etc.)
+- [ ] Note that OAuth `access_denied` redirects surface as a generic Google 500 error page in Spark's UI, not an actionable error message

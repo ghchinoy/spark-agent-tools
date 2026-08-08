@@ -7,9 +7,12 @@
 
 # Local environment / secrets
 .env
+.serena/
 
 # Build output
 /bin/
+**/bin/
+omi-bridge/bin/
 hello-mcp
 spark-agent-tools
 !spark-agent-tools/

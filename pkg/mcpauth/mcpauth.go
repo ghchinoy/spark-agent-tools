@@ -476,9 +476,11 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
 <style>
  body{font-family:system-ui,sans-serif;background:#0b1020;color:#e5e7eb;display:flex;
    min-height:100vh;align-items:center;justify-content:center;margin:0}
- .card{background:#151b2e;border:1px solid #263049;border-radius:14px;padding:2rem;max-width:420px}
+ .card{background:#151b2e;border:1px solid #263049;border-radius:14px;padding:2rem;max-width:420px;width:100%;box-sizing:border-box}
  h1{font-size:1.15rem;margin:0 0 .5rem} p{color:#9fb0c7;font-size:.9rem;line-height:1.5}
  code{background:#0b1020;padding:.1rem .35rem;border-radius:4px;font-size:.8rem;word-break:break-all}
+ label{display:block;font-size:.85rem;color:#9fb0c7;margin-top:1rem;margin-bottom:.35rem}
+ input[type="password"]{width:100%;padding:.65rem;border-radius:8px;border:1px solid #263049;background:#0b1020;color:#fff;box-sizing:border-box;font-size:.95rem}
  .row{display:flex;gap:.75rem;margin-top:1.5rem}
  button{flex:1;padding:.7rem;border-radius:8px;border:0;font-size:.95rem;cursor:pointer}
  .approve{background:#3b82f6;color:#fff} .deny{background:transparent;color:#9fb0c7;border:1px solid #263049}
@@ -493,6 +495,10 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
      <input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">
      <input type="hidden" name="code_challenge" value="{{.CodeChallenge}}">
      <input type="hidden" name="state" value="{{.State}}">
+{{if .RequirePassphrase}}
+     <label for="passphrase">Passphrase</label>
+     <input type="password" id="passphrase" name="passphrase" placeholder="Enter passphrase to authorize" required autofocus>
+{{end}}
      <div class="row">
        <button class="approve" name="decision" value="approve" type="submit">Approve &amp; Connect</button>
        <button class="deny" name="decision" value="deny" type="submit">Cancel</button>
@@ -503,6 +509,7 @@ var consentTmpl = template.Must(template.New("consent").Parse(`<!doctype html>
 
 type consentData struct {
 	ClientID, ClientName, ServerName, RedirectURI, CodeChallenge, State string
+	RequirePassphrase                                                   bool
 }
 
 // handleAuthorize is the browser-facing consent endpoint (RFC 6749 §4.1).
@@ -540,12 +547,13 @@ func (s *AuthServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_ = consentTmpl.Execute(w, consentData{
-			ClientID:      clientID,
-			ClientName:    name,
-			ServerName:    s.name,
-			RedirectURI:   redirectURI,
-			CodeChallenge: q.Get("code_challenge"),
-			State:         q.Get("state"),
+			ClientID:          clientID,
+			ClientName:        name,
+			ServerName:        s.name,
+			RedirectURI:       redirectURI,
+			CodeChallenge:     q.Get("code_challenge"),
+			State:             q.Get("state"),
+			RequirePassphrase: s.resolve != nil,
 		})
 
 	case http.MethodPost:
@@ -708,6 +716,18 @@ func (s *AuthServer) validateClientRedirect(clientID, redirectURI string) (*Clie
 		return nil, fmt.Errorf("missing client_id")
 	}
 	client, ok := s.store.GetClient(clientID)
+	if !ok {
+		// Auto-restore dynamically-issued public client IDs across server restarts
+		if strings.HasPrefix(clientID, "mcp-client-") && validateRedirectURI(redirectURI) == nil {
+			client = &Client{
+				ID:           clientID,
+				Name:         "Google",
+				RedirectURIs: []string{redirectURI},
+			}
+			_ = s.store.RegisterClient(client)
+			ok = true
+		}
+	}
 	if !ok {
 		return nil, fmt.Errorf("unknown client_id (register via /api/oauth/register first)")
 	}

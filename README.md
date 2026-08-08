@@ -78,6 +78,7 @@ click-through and a troubleshooting table are in
 | Connect a deployed server to Spark, with troubleshooting | [`docs/connecting-spark.md`](docs/connecting-spark.md) |
 | Understand *why* Spark needs the OAuth 2.1 chain | [`docs/oauth-deep-dive.md`](docs/oauth-deep-dive.md) |
 | See how Spark actually behaves — real traces and gotchas | [`docs/LESSONS_LEARNED.md`](docs/LESSONS_LEARNED.md) |
+| Connect [Omi's](https://omi.me) hosted MCP server to Spark (and see why it doesn't fully work yet) | [`docs/omi-mcp-tutorial.md`](docs/omi-mcp-tutorial.md) |
 
 ---
 
@@ -121,11 +122,20 @@ hello-world/                    MCP server: one "echo" tool, complete auth scaff
   Makefile                        developer targets (run, run-dev, test, build, deploy)
   .env.example                    config template; copy to hello-world/.env
 
+omi-bridge/                     OAuth 2.1 bridge proxy for Omi's hosted MCP server
+  main.go                         HTTP wiring: routes, passphrase consent, middleware
+  mcp.go                          proxy handler + SSE/Streamable-HTTP forwarding
+  cloudbuild.yaml                 Cloud Build config for repo-root context build
+  scripts/deploy.sh               one-command Cloud Run deploy script
+  Makefile                        developer targets
+  .env.example                    config template; copy to omi-bridge/.env
+
 docs/
   TUTORIAL.md                   build-it-yourself walkthrough
   connecting-spark.md           connect from the Spark UI + troubleshooting table
   oauth-deep-dive.md            why RFC 9728/8414/7591/7636, with request traces
   LESSONS_LEARNED.md            field notes from live Spark connections
+  omi-mcp-tutorial.md           tutorial: connecting Omi to Spark + omi-bridge guide
   architecture.webp             the discovery + auth flow, visualized
 ```
 

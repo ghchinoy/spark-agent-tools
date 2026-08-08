@@ -304,3 +304,19 @@ func TestResolveSubjectHook(t *testing.T) {
 		t.Fatal("no access token in response")
 	}
 }
+
+func TestClientAutoRestoreAcrossRestart(t *testing.T) {
+	// Verify that a valid client_id starting with 'mcp-client-' is auto-restored
+	// if a server restart wipes the in-memory store.
+	s := NewAuthServer(Options{JWTSigningKey: "test-static-key"})
+	redirectURI := "https://oauth-redirect.googleusercontent.com/r/test"
+	clientID := "mcp-client-1234567890abcdef1234567890abcdef"
+
+	client, err := s.validateClientRedirect(clientID, redirectURI)
+	if err != nil {
+		t.Fatalf("expected auto-restoration of client, got error: %v", err)
+	}
+	if client.ID != clientID {
+		t.Fatalf("want client ID %s, got %s", clientID, client.ID)
+	}
+}
